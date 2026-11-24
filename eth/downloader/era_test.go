@@ -23,24 +23,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/beacon"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+	"github.com/ethereum/go-ethereum/internal/era/execdb"
 	"github.com/ethereum/go-ethereum/internal/era/onedb"
 )
 
-// newEraTester creates a full sync downloader tester whose chain database is
-// backed by a file-based freezer in datadir, and thus by the era store in it.
-func newEraTester(t *testing.T, datadir string, success func()) *downloadTester {
+// newEraTester creates a full sync downloader tester running an archive node,
+// whose chain database is backed by a file-based freezer in datadir, and thus by
+// the era store in it.
+func newEraTester(t *testing.T, datadir string, gspec *core.Genesis, engine consensus.Engine, success func()) *downloadTester {
 	db, err := rawdb.Open(rawdb.NewMemoryDatabase(), rawdb.OpenOptions{Ancient: datadir})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	chain, err := core.NewBlockChain(db, testGspec, ethash.NewFaker(), core.DefaultConfig().WithArchive(true))
+	chain, err := core.NewBlockChain(db, gspec, engine, core.DefaultConfig().WithArchive(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +57,9 @@ func newEraTester(t *testing.T, datadir string, success func()) *downloadTester 
 	return tester
 }
 
-// writeEraFile exports the given blocks, starting at genesis, as the first era1
-// epoch into the era store of the datadir.
+// writeEraFile exports the given blocks, starting at genesis, as the first epoch
+// into the era store of the datadir. Pre-merge chains are written as era1 files,
+// post-merge chains as ere files.
 func writeEraFile(t *testing.T, datadir string, source *core.BlockChain, blocks []*types.Block) {
 	dir := filepath.Join(datadir, rawdb.ChainFreezerName, "era")
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -65,28 +70,63 @@ func writeEraFile(t *testing.T, datadir string, source *core.BlockChain, blocks 
 		t.Fatal(err)
 	}
 	var (
-		builder = onedb.NewBuilder(f)
-		td      = new(big.Int)
+		postMerge = blocks[0].Difficulty().Sign() == 0
+		builder   = onedb.NewBuilder(f)
+		filename  = onedb.Filename
+		td        = new(big.Int)
 	)
+	if postMerge {
+		builder, filename = execdb.NewBuilder(f), execdb.Filename
+	}
 	for _, block := range blocks {
-		td.Add(td, block.Difficulty())
 		receipts := source.GetReceiptsByHash(block.Hash())
 		if receipts == nil {
 			receipts = types.Receipts{}
 		}
-		if err := builder.Add(block, receipts, new(big.Int).Set(td)); err != nil {
+		var blockTD *big.Int
+		if !postMerge {
+			td.Add(td, block.Difficulty())
+			blockTD = new(big.Int).Set(td)
+		}
+		if err := builder.Add(block, receipts, blockTD); err != nil {
 			t.Fatal(err)
 		}
 	}
-	root, err := builder.Finalize()
+	id, err := builder.Finalize()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(f.Name(), filepath.Join(dir, onedb.Filename("mainnet", 0, root))); err != nil {
+	if err := os.Rename(f.Name(), filepath.Join(dir, filename("mainnet", 0, id))); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// syncFromEra beacon syncs the tester to the head of the given chain, failing
+// the test if it doesn't complete in time.
+func syncFromEra(t *testing.T, tester *downloadTester, success chan struct{}, blocks []*types.Block) {
+	t.Helper()
+
+	if err := tester.downloader.BeaconSync(blocks[len(blocks)-1].Header(), nil); err != nil {
+		t.Fatalf("failed to beacon-sync chain: %v", err)
+	}
+	select {
+	case <-success:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("failed to sync chain in ten seconds, head %d", tester.chain.CurrentBlock().Number)
+	}
+	assertOwnChain(t, tester, len(blocks))
+
+	// The chain was executed in archive mode, every historical state must be there.
+	for _, block := range blocks {
+		if have := tester.chain.GetCanonicalHash(block.NumberU64()); have != block.Hash() {
+			t.Fatalf("block %d: canonical hash mismatch: have %x, want %x", block.NumberU64(), have, block.Hash())
+		}
+		if !tester.chain.HasState(block.Root()) {
+			t.Fatalf("block %d: missing state %x", block.NumberU64(), block.Root())
+		}
 	}
 }
 
@@ -102,32 +142,47 @@ func TestEraFullSync(t *testing.T) {
 	writeEraFile(t, datadir, source, chain.blocks[:eraLen])
 
 	success := make(chan struct{})
-	tester := newEraTester(t, datadir, func() { close(success) })
+	tester := newEraTester(t, datadir, testGspec, ethash.NewFaker(), func() { close(success) })
 	defer tester.terminate()
 
 	// The only peer refuses to serve the bodies covered by the era file.
 	peer := tester.newPeerWithChain("peer", eth.ETH69, source, nil)
 	peer.withholdBelow = uint64(eraLen)
 
-	if err := tester.downloader.BeaconSync(chain.blocks[len(chain.blocks)-1].Header(), nil); err != nil {
-		t.Fatalf("failed to beacon-sync chain: %v", err)
+	syncFromEra(t, tester, success, chain.blocks)
+	if have, want := tester.chain.CurrentBlock().Root, source.CurrentBlock().Root; have != want {
+		t.Fatalf("head state root mismatch: have %x, want %x", have, want)
 	}
-	select {
-	case <-success:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("failed to sync chain in ten seconds, head %d", tester.chain.CurrentBlock().Number)
-	}
-	assertOwnChain(t, tester, len(chain.blocks))
+}
 
-	// The chain was executed in archive mode, every historical state must be there.
-	for _, block := range chain.blocks {
-		if have := tester.chain.GetCanonicalHash(block.NumberU64()); have != block.Hash() {
-			t.Fatalf("block %d: canonical hash mismatch: have %x, want %x", block.NumberU64(), have, block.Hash())
-		}
-		if !tester.chain.HasState(block.Root()) {
-			t.Fatalf("block %d: missing state %x", block.NumberU64(), block.Root())
-		}
+// Tests that full sync executes post-merge blocks, which carry withdrawals, from
+// ere files in the datadir.
+func TestEraFullSyncPostMerge(t *testing.T) {
+	var (
+		datadir       = t.TempDir()
+		gspec, blocks = makeBALChain(96)
+		engine        = beacon.New(ethash.NewFaker())
+		eraLen        = 64
+		success       = make(chan struct{})
+		chain         = append([]*types.Block{gspec.ToBlock()}, blocks...)
+		source, err   = core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, engine, nil)
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer source.Stop()
+	if _, err := source.InsertChain(blocks); err != nil {
+		t.Fatal(err)
+	}
+	writeEraFile(t, datadir, source, chain[:eraLen])
+
+	tester := newEraTester(t, datadir, gspec, engine, func() { close(success) })
+	defer tester.terminate()
+
+	peer := tester.newPeerWithChain("peer", eth.ETH69, source, nil)
+	peer.withholdBelow = uint64(eraLen)
+
+	syncFromEra(t, tester, success, chain)
 	if have, want := tester.chain.CurrentBlock().Root, source.CurrentBlock().Root; have != want {
 		t.Fatalf("head state root mismatch: have %x, want %x", have, want)
 	}
@@ -148,20 +203,11 @@ func TestEraFullSyncInvalidBody(t *testing.T) {
 	writeEraFile(t, datadir, source, blocks)
 
 	success := make(chan struct{})
-	tester := newEraTester(t, datadir, func() { close(success) })
+	tester := newEraTester(t, datadir, testGspec, ethash.NewFaker(), func() { close(success) })
 	defer tester.terminate()
 
 	peer := tester.newPeerWithChain("peer", eth.ETH69, source, nil)
-
-	if err := tester.downloader.BeaconSync(chain.blocks[len(chain.blocks)-1].Header(), nil); err != nil {
-		t.Fatalf("failed to beacon-sync chain: %v", err)
-	}
-	select {
-	case <-success:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("failed to sync chain in ten seconds, head %d", tester.chain.CurrentBlock().Number)
-	}
-	assertOwnChain(t, tester, len(chain.blocks))
+	syncFromEra(t, tester, success, chain.blocks)
 
 	// Everything below the invalid body was imported from the era file, while
 	// the invalid block and its descendants came from the network.
