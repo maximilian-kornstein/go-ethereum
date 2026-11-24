@@ -146,6 +146,10 @@ be gzipped.`,
 		Description: `
 The import-history command will import blocks and their corresponding receipts
 from Era archives.
+
+This is not required for syncing a full or archive node: era files placed in the
+era directory of the datadir (see --datadir.era and 'geth download-era') are
+executed from there by full sync.
 `,
 	}
 	exportHistoryCommand = &cli.Command{
@@ -228,6 +232,14 @@ database tail cannot be undone except by importing history back.`,
 		Name:      "download-era",
 		Usage:     "Fetches era1 files (pre-merge history) from an HTTP endpoint",
 		ArgsUsage: "",
+		Description: `
+The download-era command fetches era1 files into the era directory of the datadir
+(see --datadir.era), verifying them against the known checksums of the network.
+
+Full sync executes the blocks contained in these files from there, instead of
+downloading them from the network. Nodes with pruned history serve the bodies and
+receipts of pruned blocks from them.
+`,
 		Flags: slices.Concat(
 			utils.DatabaseFlags,
 			utils.NetworkFlags,
