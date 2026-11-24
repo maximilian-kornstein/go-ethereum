@@ -115,6 +115,22 @@ func (e *Era) GetBlockByNumber(num uint64) (*types.Block, error) {
 	return types.NewBlockWithHeader(&header).WithBody(body), nil
 }
 
+// GetRawHeaderByNumber returns the RLP-encoded header for the given block number.
+func (e *Era) GetRawHeaderByNumber(num uint64) ([]byte, error) {
+	if e.m.start > num || e.m.start+e.m.count <= num {
+		return nil, fmt.Errorf("out-of-bounds: %d not in [%d, %d)", num, e.m.start, e.m.start+e.m.count)
+	}
+	off, err := e.readOffset(num)
+	if err != nil {
+		return nil, err
+	}
+	r, _, err := newSnappyReader(e.s, era.TypeCompressedHeader, off)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
+}
+
 // GetRawBodyByNumber returns the RLP-encoded body for the given block number.
 func (e *Era) GetRawBodyByNumber(num uint64) ([]byte, error) {
 	if e.m.start > num || e.m.start+e.m.count <= num {

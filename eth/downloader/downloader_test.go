@@ -154,11 +154,13 @@ type downloadTesterPeer struct {
 	balGate        *balGate // if set, body deliveries wait for the access lists
 	announceLag    uint64   // blocks the announced latest trails the real head by
 	withholdBelow  uint64   // if set, the peer refuses to serve bodies below this number
+	withholdHeader uint64   // if set, the peer refuses to serve headers below this number
 	id             string
 	chain          *core.BlockChain
 
-	servedLock   sync.Mutex
-	servedBodies []uint64 // numbers of the block bodies served
+	servedLock    sync.Mutex
+	servedBodies  []uint64 // numbers of the block bodies served
+	servedHeaders []uint64 // numbers of the headers served
 
 	dropped chan error // signaled when res.Done receives an error
 }
@@ -240,7 +242,7 @@ func (dlp *downloadTesterPeer) RequestHeadersByHash(origin common.Hash, amount i
 		Skip:    uint64(skip),
 		Reverse: reverse,
 	}, nil)
-	headers := unmarshalRlpHeaders(rlpHeaders)
+	headers := dlp.trackHeaders(unmarshalRlpHeaders(rlpHeaders))
 	hashes := make([]common.Hash, len(headers))
 	for i, header := range headers {
 		hashes[i] = header.Hash()
@@ -275,7 +277,7 @@ func (dlp *downloadTesterPeer) RequestHeadersByNumber(origin uint64, amount int,
 		Skip:    uint64(skip),
 		Reverse: reverse,
 	}, nil)
-	headers := unmarshalRlpHeaders(rlpHeaders)
+	headers := dlp.trackHeaders(unmarshalRlpHeaders(rlpHeaders))
 	hashes := make([]common.Hash, len(headers))
 	for i, header := range headers {
 		hashes[i] = header.Hash()
@@ -333,6 +335,38 @@ func (dlp *downloadTesterPeer) trackBodies(hashes []common.Hash) []common.Hash {
 		dlp.servedBodies = append(dlp.servedBodies, header.Number.Uint64())
 	}
 	return hashes
+}
+
+// trackHeaders records the numbers of the headers that are going to be served,
+// refusing the entire batch if it contains a withheld one.
+func (dlp *downloadTesterPeer) trackHeaders(headers []*types.Header) []*types.Header {
+	dlp.servedLock.Lock()
+	defer dlp.servedLock.Unlock()
+
+	for _, header := range headers {
+		if header.Number.Uint64() < dlp.withholdHeader {
+			return nil
+		}
+	}
+	for _, header := range headers {
+		dlp.servedHeaders = append(dlp.servedHeaders, header.Number.Uint64())
+	}
+	return headers
+}
+
+// headersServedBelow returns the number of headers below the given number served
+// by the peer.
+func (dlp *downloadTesterPeer) headersServedBelow(number uint64) int {
+	dlp.servedLock.Lock()
+	defer dlp.servedLock.Unlock()
+
+	var count int
+	for _, n := range dlp.servedHeaders {
+		if n < number {
+			count++
+		}
+	}
+	return count
 }
 
 // bodiesServedBelow returns the number of block bodies below the given number

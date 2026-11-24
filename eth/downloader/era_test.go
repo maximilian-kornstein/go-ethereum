@@ -224,3 +224,81 @@ func TestEraFullSyncInvalidBody(t *testing.T) {
 		t.Fatal("canonical block reported as bad")
 	}
 }
+
+// Tests that the skeleton header chain of the range covered by the era files is
+// filled from there, so neither the headers nor the bodies of that range need to
+// be retrieved from the network.
+func TestEraFullSyncHeaders(t *testing.T) {
+	var (
+		datadir = t.TempDir()
+		chain   = testChainBase.shorten(blockCacheMaxItems - 15)
+		source  = newTestBlockchain(chain.blocks[1:])
+		eraLen  = len(chain.blocks) / 2
+
+		// The skeleton requests header batches downward from the parent of the
+		// head; everything below the first batch is covered by the era file.
+		boundary = uint64(len(chain.blocks)-2) - requestHeaders + 1
+	)
+	writeEraFile(t, datadir, source, chain.blocks[:eraLen])
+
+	success := make(chan struct{})
+	tester := newEraTester(t, datadir, testGspec, ethash.NewFaker(), func() { close(success) })
+	defer tester.terminate()
+
+	peer := tester.newPeerWithChain("peer", eth.ETH69, source, nil)
+	peer.withholdHeader = boundary
+	peer.withholdBelow = uint64(eraLen)
+
+	syncFromEra(t, tester, success, chain.blocks)
+	if have := peer.headersServedBelow(boundary); have != 0 {
+		t.Fatalf("headers of the era range retrieved from the network: %d", have)
+	}
+}
+
+// Tests that era headers which don't link up with the beacon header chain are
+// rejected, and the headers are retrieved from the network instead.
+func TestEraFullSyncInvalidHeaders(t *testing.T) {
+	var (
+		chain    = testChainBase.shorten(blockCacheMaxItems - 15)
+		source   = newTestBlockchain(chain.blocks[1:])
+		eraLen   = len(chain.blocks) / 2
+		boundary = uint64(len(chain.blocks)-2) - requestHeaders + 1
+	)
+	// A single tampered header breaks the hash chain inside the era file.
+	tampered := append([]*types.Block{}, chain.blocks[:eraLen]...)
+	header := tampered[300].Header()
+	header.Extra = []byte("tampered")
+	tampered[300] = types.NewBlockWithHeader(header).WithBody(*tampered[300].Body())
+
+	// A forged chain is consistent in itself, but doesn't link to the beacon chain.
+	forged := testChainBase.shorten(1).makeFork(eraLen-1, false, 0xaa).blocks
+
+	for name, blocks := range map[string][]*types.Block{"tampered": tampered, "forged": forged} {
+		t.Run(name, func(t *testing.T) {
+			datadir := t.TempDir()
+			writeEraFile(t, datadir, source, blocks)
+
+			success := make(chan struct{})
+			tester := newEraTester(t, datadir, testGspec, ethash.NewFaker(), func() { close(success) })
+			defer tester.terminate()
+
+			peer := tester.newPeerWithChain("peer", eth.ETH69, source, nil)
+			syncFromEra(t, tester, success, chain.blocks)
+
+			if peer.headersServedBelow(boundary) == 0 {
+				t.Fatal("headers of the era range not retrieved from the network")
+			}
+			tester.lock.RLock()
+			_, ok := tester.peers["peer"]
+			tester.lock.RUnlock()
+			if !ok {
+				t.Fatal("peer dropped for invalid era headers")
+			}
+			for _, block := range chain.blocks {
+				if rawdb.ReadBadBlock(tester.db, block.Hash()) != nil {
+					t.Fatalf("canonical block %d reported as bad", block.NumberU64())
+				}
+			}
+		})
+	}
+}

@@ -136,3 +136,116 @@ func verifyEraBody(header *types.Header, body *types.Body, hasher *trie.StackTri
 	}
 	return nil
 }
+
+const (
+	// eraFillOwner marks the parts of the skeleton scratch space which were
+	// filled from the local era files instead of a remote peer.
+	eraFillOwner = "era-files"
+
+	// eraFillTasks is the maximum number of skeleton scratch space tasks to fill
+	// from the local era files at once, keeping the skeleton runloop responsive.
+	eraFillTasks = 16
+)
+
+// fillFromEra fills the free parts of the skeleton scratch space with headers
+// read from the local era files, instead of retrieving them from the network,
+// and consumes them into the primary subchain. The returned filled flag reports
+// whether any headers were taken from the era files, in which case more might be
+// available after the scratch space was consumed.
+//
+// Era files are untrusted: the headers go through the same validation as the
+// ones delivered by peers, i.e. each must hash-link to the trusted subchain above
+// it, otherwise the era files are disregarded for the rest of the sync cycle and
+// the headers are retrieved from the network.
+func (s *skeleton) fillFromEra() (filled bool, linked bool, merged bool) {
+	if s.eraFailed {
+		return false, false, false
+	}
+	var tasks int
+	for task, owner := range s.scratchOwners {
+		if tasks == eraFillTasks {
+			break
+		}
+		// Skip any tasks already filling, stop when reaching the genesis
+		if owner != "" {
+			continue
+		}
+		if uint64(task*requestHeaders) >= s.scratchHead {
+			break
+		}
+		head := s.scratchHead - uint64(task*requestHeaders)
+		if head == s.eraMiss {
+			break
+		}
+		headers, err := s.readEraHeaders(head)
+		if err != nil {
+			log.Warn("Unusable headers in era files", "head", head, "err", err)
+			s.revertEraTasks()
+			return false, false, false
+		}
+		if headers == nil {
+			s.eraMiss = head
+			break
+		}
+		if !s.eraLogged {
+			log.Info("Filling beacon headers from era files", "from", head)
+			s.eraLogged = true
+		}
+		copy(s.scratchSpace[task*requestHeaders:], headers)
+		s.scratchOwners[task] = eraFillOwner
+		tasks++
+	}
+	if tasks == 0 {
+		return false, false, false
+	}
+	linked, merged = s.consumeScratch()
+	return true, linked, merged
+}
+
+// readEraHeaders reads the batch of headers starting at head and going backwards
+// from the local era files, checking their hash progression. Similarly to header
+// requests sent to peers, the genesis header is never included. Nil is returned
+// if the era files don't cover the entire batch.
+func (s *skeleton) readEraHeaders(head uint64) ([]*types.Header, error) {
+	count := uint64(requestHeaders)
+	if head < requestHeaders {
+		count = head
+	}
+	headers := make([]*types.Header, 0, count)
+	for number := head; number > head-count; number-- {
+		data, err := rawdb.ReadEraHeaderRLP(s.db, number)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, nil
+		}
+		header := new(types.Header)
+		if err := rlp.DecodeBytes(data, header); err != nil {
+			return nil, fmt.Errorf("invalid header %d: %v", number, err)
+		}
+		if header.Number == nil || header.Number.Uint64() != number {
+			return nil, fmt.Errorf("header %d has wrong number %v", number, header.Number)
+		}
+		if n := len(headers); n > 0 && headers[n-1].ParentHash != header.Hash() {
+			return nil, fmt.Errorf("invalid hash progression at header %d", number)
+		}
+		headers = append(headers, header)
+	}
+	return headers, nil
+}
+
+// revertEraTasks drops the parts of the scratch space filled from the era files,
+// and disables filling from them for the rest of the sync cycle.
+func (s *skeleton) revertEraTasks() {
+	s.eraFailed = true
+	for task, owner := range s.scratchOwners {
+		if owner != eraFillOwner {
+			continue
+		}
+		for i := task * requestHeaders; i < (task+1)*requestHeaders; i++ {
+			s.scratchSpace[i] = nil
+		}
+		s.scratchOwners[task] = ""
+	}
+}

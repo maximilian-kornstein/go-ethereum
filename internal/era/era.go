@@ -107,6 +107,7 @@ type Era interface {
 	Count() uint64
 	Iterator() (Iterator, error)
 	GetBlockByNumber(num uint64) (*types.Block, error)
+	GetRawHeaderByNumber(num uint64) ([]byte, error)
 	GetRawBodyByNumber(num uint64) ([]byte, error)
 	GetRawReceiptsByNumber(num uint64) ([]byte, error)
 	InitialTD() (*big.Int, error)

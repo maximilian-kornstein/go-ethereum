@@ -224,6 +224,10 @@ type skeleton struct {
 
 	requests map[uint64]*headerRequest // Header requests currently running
 
+	eraFailed bool   // Whether the era files failed to extend the skeleton in this sync cycle
+	eraMiss   uint64 // Head of the last header batch found missing from the era files
+	eraLogged bool   // Whether the era header filling was reported in this sync cycle
+
 	headEvents chan *headUpdate // Notification channel for new heads
 	terminate  chan chan error  // Termination channel to abort sync
 	terminated chan struct{}    // Channel to signal that the syncer is dead
@@ -412,6 +416,7 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	defer func() { s.scratchOwners = nil }() // don't hold on to references after sync
 
 	s.scratchHead = s.progress.Subchains[0].Tail - 1 // tail must not be 0!
+	s.eraFailed, s.eraMiss, s.eraLogged = false, 0, false
 
 	// If the sync is already done, resume the backfiller. When the loop stops,
 	// terminate the backfiller too.
@@ -479,17 +484,38 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	for _, peer := range s.peers.AllPeers() {
 		s.idles[peer.id] = peer
 	}
+	// Self-notification channel to continue filling headers from the era files
+	eraWake := make(chan struct{}, 1)
+
 	// Notify any tester listening for startup events
 	if s.syncStarting != nil {
 		s.syncStarting()
 	}
 	for {
-		// Something happened, try to assign new tasks to any idle peers
+		// Something happened, try to fill the scratch space from the local era
+		// files, and assign the remaining tasks to any idle peers
 		if !linked {
+			eraFilled, eraLinked, eraMerged := s.fillFromEra()
+			if eraLinked {
+				log.Debug("Beacon sync linked to local chain")
+				return nil, errSyncLinked
+			}
+			if eraMerged {
+				log.Debug("Beacon sync merged subchains")
+				return nil, errSyncMerged
+			}
+			if eraFilled {
+				select {
+				case eraWake <- struct{}{}:
+				default:
+				}
+			}
 			s.assignTasks(responses, requestFails, cancel)
 		}
 		// Wait for something to happen
 		select {
+		case <-eraWake:
+			// More headers might be available in the era files, loop and fill
 		case event := <-peering:
 			// A peer joined or left, the tasks queue and allocations need to be
 			// checked for potential assignment or reassignment
@@ -1037,6 +1063,12 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 	head := res.headers[0].Number.Uint64()
 	copy(s.scratchSpace[s.scratchHead-head:], res.headers)
 
+	return s.consumeScratch()
+}
+
+// consumeScratch moves the headers at the head of the scratch space into the
+// primary subchain, as long as they link up with it.
+func (s *skeleton) consumeScratch() (linked bool, merged bool) {
 	// If there's still a gap in the head of the scratch space, abort
 	if s.scratchSpace[0] == nil {
 		return false, false
@@ -1056,11 +1088,16 @@ func (s *skeleton) processResponse(res *headerResponse) (linked bool, merged boo
 
 			// The peer delivered junk, or at least not the subchain we are
 			// syncing to. Free up the scratch space and assignment, reassign
-			// and drop the original peer.
+			// and drop the original peer. If the junk came from the era files,
+			// stop using them for the rest of the sync cycle instead.
 			for i := 0; i < requestHeaders; i++ {
 				s.scratchSpace[i] = nil
 			}
-			s.drop(s.scratchOwners[0])
+			if s.scratchOwners[0] == eraFillOwner {
+				s.revertEraTasks()
+			} else {
+				s.drop(s.scratchOwners[0])
+			}
 			s.scratchOwners[0] = ""
 			break
 		}

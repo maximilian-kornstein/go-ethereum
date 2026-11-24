@@ -417,6 +417,26 @@ func ReadCanonicalBodyRLP(db ethdb.Reader, number uint64, hash *common.Hash) rlp
 	return data
 }
 
+// ReadEraHeaderRLP retrieves the header of the block with the given number from
+// the era files backing the chain freezer, regardless of whether the block is
+// present in the database. Nil is returned if no era file covers the block.
+//
+// Era files are untrusted input, the caller is responsible for verifying that
+// the returned header is part of the canonical chain.
+func ReadEraHeaderRLP(db ethdb.Reader, number uint64) (rlp.RawValue, error) {
+	var (
+		data rlp.RawValue
+		err  error
+	)
+	db.ReadAncients(func(reader ethdb.AncientReaderOp) error {
+		if f, ok := reader.(*chainFreezer); ok && f.eradb != nil {
+			data, err = f.eradb.GetRawHeader(number)
+		}
+		return nil
+	})
+	return data, err
+}
+
 // ReadEraBodyRLP retrieves the block body (transactions and uncles) for the block
 // with the given number from the era files backing the chain freezer, regardless
 // of whether the block is present in the database. Nil is returned if no era file

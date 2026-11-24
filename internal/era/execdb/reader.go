@@ -169,6 +169,20 @@ func (e *Era) GetTD(blockNum uint64) (*big.Int, error) {
 	return td, nil
 }
 
+// GetRawHeaderByNumber returns the RLP-encoded header for the given block number.
+func (e *Era) GetRawHeaderByNumber(blockNum uint64) ([]byte, error) {
+	off, err := e.headerOff(blockNum)
+	if err != nil {
+		return nil, err
+	}
+	r, _, err := e.s.ReaderAt(era.TypeCompressedHeader, off)
+	if err != nil {
+		return nil, err
+	}
+	r = snappy.NewReader(r)
+	return io.ReadAll(r)
+}
+
 // GetRawBodyByNumber returns the RLP-encoded body for the given block number.
 func (e *Era) GetRawBodyByNumber(blockNum uint64) ([]byte, error) {
 	off, err := e.bodyOff(blockNum)

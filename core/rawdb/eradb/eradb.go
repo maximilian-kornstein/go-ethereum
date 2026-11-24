@@ -103,7 +103,27 @@ func (db *Store) Close() {
 	}
 }
 
-// GetRawBody returns the raw body for a given block number.
+// GetRawHeader returns the raw header for a given block number. Nil is returned
+// if no era file covers the block.
+func (db *Store) GetRawHeader(number uint64) ([]byte, error) {
+	epoch := number / uint64(era.MaxSize)
+	entry := db.getEraByEpoch(epoch)
+	if entry.err != nil {
+		if errors.Is(entry.err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, entry.err
+	}
+	defer db.doneWithFile(epoch, entry)
+
+	if !entry.covers(number) {
+		return nil, nil
+	}
+	return entry.file.GetRawHeaderByNumber(number)
+}
+
+// GetRawBody returns the raw body for a given block number. Nil is returned if
+// no era file covers the block.
 func (db *Store) GetRawBody(number uint64) ([]byte, error) {
 	epoch := number / uint64(era.MaxSize)
 	entry := db.getEraByEpoch(epoch)
@@ -115,10 +135,14 @@ func (db *Store) GetRawBody(number uint64) ([]byte, error) {
 	}
 	defer db.doneWithFile(epoch, entry)
 
+	if !entry.covers(number) {
+		return nil, nil
+	}
 	return entry.file.GetRawBodyByNumber(number)
 }
 
-// GetRawReceipts returns the raw receipts for a given block number.
+// GetRawReceipts returns the raw receipts for a given block number. Nil is returned
+// if no era file covers the block.
 func (db *Store) GetRawReceipts(number uint64) ([]byte, error) {
 	epoch := number / uint64(era.MaxSize)
 	entry := db.getEraByEpoch(epoch)
@@ -130,6 +154,9 @@ func (db *Store) GetRawReceipts(number uint64) ([]byte, error) {
 	}
 	defer db.doneWithFile(epoch, entry)
 
+	if !entry.covers(number) {
+		return nil, nil
+	}
 	data, err := entry.file.GetRawReceiptsByNumber(number)
 	if err != nil {
 		return nil, err
@@ -374,6 +401,12 @@ func (db *Store) doneWithFile(epoch uint64, entry *fileCacheEntry) {
 
 // derefAndClose decrements the reference counter and closes the file
 // when it hits zero.
+// covers reports whether the block is contained in the file. The last file of
+// the history may hold less than a full epoch of blocks.
+func (entry *fileCacheEntry) covers(number uint64) bool {
+	return number < entry.file.Start()+entry.file.Count()
+}
+
 func (entry *fileCacheEntry) derefAndClose(epoch uint64) (closed bool) {
 	entry.refcount--
 	if entry.refcount > 0 {

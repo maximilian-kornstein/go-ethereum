@@ -51,6 +51,28 @@ func TestEraDatabase(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, receipts, "receipts not found")
 	assert.Equal(t, 3, len(receipts), "receipts length mismatch")
+
+	checkRawHeaders(t, db)
+}
+
+// checkRawHeaders checks that the store serves the headers from the sepolia
+// testdata, and nothing for blocks outside of the files.
+func checkRawHeaders(t *testing.T, db *Store) {
+	t.Helper()
+
+	var parent, header types.Header
+	r, err := db.GetRawHeader(175880)
+	require.NoError(t, err)
+	require.NoError(t, rlp.DecodeBytes(r, &parent))
+	r, err = db.GetRawHeader(175881)
+	require.NoError(t, err)
+	require.NoError(t, rlp.DecodeBytes(r, &header))
+	assert.Equal(t, uint64(175881), header.Number.Uint64())
+	assert.Equal(t, parent.Hash(), header.ParentHash)
+
+	r, err = db.GetRawHeader(8192)
+	require.NoError(t, err)
+	assert.Nil(t, r, "header served for missing era file")
 }
 
 // TestEreDatabase checks that the store can serve bodies and receipts from a
@@ -98,7 +120,14 @@ func TestEreDatabase(t *testing.T) {
 		gotBody, err := db.GetRawBody(num)
 		require.NoError(t, err)
 		assert.Equal(t, wantBody, gotBody, "body mismatch at block %d", num)
+
+		wantHeader, err := eraDB.GetRawHeader(num)
+		require.NoError(t, err)
+		gotHeader, err := db.GetRawHeader(num)
+		require.NoError(t, err)
+		assert.Equal(t, wantHeader, gotHeader, "header mismatch at block %d", num)
 	}
+	checkRawHeaders(t, db)
 }
 
 // TestEreDatabaseNoReceipts checks that ere files written with the
