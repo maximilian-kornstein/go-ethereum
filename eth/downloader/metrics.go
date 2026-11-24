@@ -57,6 +57,7 @@ var (
 	importInsertBlocksTimer   = metrics.NewRegisteredTimer("eth/downloader/import/blocks", nil)
 	importInsertReceiptsTimer = metrics.NewRegisteredTimer("eth/downloader/import/receipts", nil)
 	importBatchHistogram      = metrics.NewRegisteredHistogram("eth/downloader/import/batch", nil, metrics.NewExpDecaySample(1028, 0.015))
+	importEraBlocksMeter      = metrics.NewRegisteredMeter("eth/downloader/import/era", nil)
 
 	// Result cache metrics, reported every time a batch is drained.
 	queueThrottleGauge = metrics.NewRegisteredGauge("eth/downloader/queue/throttle/threshold", nil)

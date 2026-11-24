@@ -417,6 +417,27 @@ func ReadCanonicalBodyRLP(db ethdb.Reader, number uint64, hash *common.Hash) rlp
 	return data
 }
 
+// ReadEraBodyRLP retrieves the block body (transactions and uncles) for the block
+// with the given number from the era files backing the chain freezer, regardless
+// of whether the block is present in the database. Nil is returned if no era file
+// covers the block.
+//
+// Era files are untrusted input, the caller is responsible for verifying the
+// returned body against the canonical header of the block.
+func ReadEraBodyRLP(db ethdb.Reader, number uint64) (rlp.RawValue, error) {
+	var (
+		data rlp.RawValue
+		err  error
+	)
+	db.ReadAncients(func(reader ethdb.AncientReaderOp) error {
+		if f, ok := reader.(*chainFreezer); ok && f.eradb != nil {
+			data, err = f.eradb.GetRawBody(number)
+		}
+		return nil
+	})
+	return data, err
+}
+
 // WriteBodyRLP stores an RLP encoded block body into the database.
 func WriteBodyRLP(db ethdb.KeyValueWriter, hash common.Hash, number uint64, rlp rlp.RawValue) {
 	if err := db.Put(blockBodyKey(number, hash), rlp); err != nil {

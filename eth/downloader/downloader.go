@@ -618,6 +618,21 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 			log.Info("Truncated excess ancient chain segment", "oldhead", frozen-1, "newhead", origin)
 		}
 	}
+	// In full sync, execute the chain segment covered by the local era files
+	// before turning to the network. The import can take very long, so signal
+	// the beacon syncer that it's safe to cancel the cycle while it's running.
+	if mode == ethconfig.FullSync {
+		d.cancelWg.Add(1)
+		if beaconPing != nil {
+			close(beaconPing)
+			beaconPing = nil
+		}
+		origin, err = d.importEraBlocks(origin)
+		d.cancelWg.Done()
+		if err != nil {
+			return err
+		}
+	}
 	// Skip ancient chain segments if Geth is running with a configured chain cutoff.
 	// These segments are not guaranteed to be available in the network.
 	chainOffset := origin + 1

@@ -153,8 +153,12 @@ type downloadTesterPeer struct {
 	corruptBodies  bool     // if set, the peer serves incorrect blocks
 	balGate        *balGate // if set, body deliveries wait for the access lists
 	announceLag    uint64   // blocks the announced latest trails the real head by
+	withholdBelow  uint64   // if set, the peer refuses to serve bodies below this number
 	id             string
 	chain          *core.BlockChain
+
+	servedLock   sync.Mutex
+	servedBodies []uint64 // numbers of the block bodies served
 
 	dropped chan error // signaled when res.Done receives an error
 }
@@ -312,10 +316,45 @@ func (dlp *downloadTesterPeer) BlockRange() *eth.BlockRangeUpdatePacket {
 	}
 }
 
+// trackBodies records the numbers of the requested block bodies that are going to
+// be served, cutting the request short at the first withheld one.
+func (dlp *downloadTesterPeer) trackBodies(hashes []common.Hash) []common.Hash {
+	dlp.servedLock.Lock()
+	defer dlp.servedLock.Unlock()
+
+	for i, hash := range hashes {
+		header := dlp.chain.GetHeaderByHash(hash)
+		if header == nil {
+			continue
+		}
+		if header.Number.Uint64() < dlp.withholdBelow {
+			return hashes[:i]
+		}
+		dlp.servedBodies = append(dlp.servedBodies, header.Number.Uint64())
+	}
+	return hashes
+}
+
+// bodiesServedBelow returns the number of block bodies below the given number
+// served by the peer.
+func (dlp *downloadTesterPeer) bodiesServedBelow(number uint64) int {
+	dlp.servedLock.Lock()
+	defer dlp.servedLock.Unlock()
+
+	var count int
+	for _, n := range dlp.servedBodies {
+		if n < number {
+			count++
+		}
+	}
+	return count
+}
+
 // RequestBodies constructs a getBlockBodies method associated with a particular
 // peer in the download tester. The returned function can be used to retrieve
 // batches of block bodies from the particularly requested peer.
 func (dlp *downloadTesterPeer) RequestBodies(hashes []common.Hash, sink chan *eth.Response) (*eth.Request, error) {
+	hashes = dlp.trackBodies(hashes)
 	blobs := eth.ServiceGetBlockBodiesQuery(dlp.chain, hashes)
 
 	bodies := make([]*types.Body, len(blobs))
